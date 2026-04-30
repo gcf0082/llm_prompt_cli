@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	openai "github.com/sashabaranov/go-openai"
 	"github.com/joho/godotenv"
@@ -99,15 +100,28 @@ func main() {
 		model = "glm-4.7"
 	}
 
-	maxTokens := 8192
+	params := chatParams{maxTokens: 8192}
 	if v := os.Getenv("maxTokens"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil || n <= 0 {
-			fmt.Fprintf(os.Stderr, "Warning: invalid maxTokens=%q, using default %d\n", v, maxTokens)
+			fmt.Fprintf(os.Stderr, "Warning: invalid maxTokens=%q, using default %d\n", v, params.maxTokens)
 		} else {
-			maxTokens = n
+			params.maxTokens = n
 		}
 	}
+	params.temperature = parseFloatEnv("temperature")
+	params.topP = parseFloatEnv("topP")
+	params.presencePenalty = parseFloatEnv("presencePenalty")
+	params.frequencyPenalty = parseFloatEnv("frequencyPenalty")
+	if v := os.Getenv("timeout"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			fmt.Fprintf(os.Stderr, "Warning: invalid timeout=%q, ignored\n", v)
+		} else {
+			params.timeoutSec = n
+		}
+	}
+	params.showThinking = parseBoolEnv("showThinking")
 
 	customHeaders := parseEnvHeaders(os.Getenv("headers"))
 
@@ -167,7 +181,7 @@ func main() {
 		})
 	}
 
-	if err := streamChat(baseURL, apiKey, model, messages, customHeaders, maxTokens); err != nil {
+	if err := streamChat(baseURL, apiKey, model, messages, customHeaders, params); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
@@ -184,6 +198,39 @@ func (t *customTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		req.Header.Set(k, v)
 	}
 	return t.base.RoundTrip(req)
+}
+
+type chatParams struct {
+	maxTokens        int
+	temperature      *float32
+	topP             *float32
+	presencePenalty  *float32
+	frequencyPenalty *float32
+	timeoutSec       int
+	showThinking     bool
+}
+
+func parseFloatEnv(key string) *float32 {
+	v := os.Getenv(key)
+	if v == "" {
+		return nil
+	}
+	f, err := strconv.ParseFloat(v, 32)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: invalid %s=%q, ignored\n", key, v)
+		return nil
+	}
+	out := float32(f)
+	return &out
+}
+
+func parseBoolEnv(key string) bool {
+	v := strings.TrimSpace(strings.ToLower(os.Getenv(key)))
+	switch v {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
 }
 
 func parseEnvHeaders(envVal string) map[string]string {
@@ -217,7 +264,7 @@ func readStdin() (string, error) {
 	return string(data), nil
 }
 
-func streamChat(baseURL, apiKey, model string, messages []openai.ChatCompletionMessage, customHeaders map[string]string, maxTokens int) error {
+func streamChat(baseURL, apiKey, model string, messages []openai.ChatCompletionMessage, customHeaders map[string]string, params chatParams) error {
 	config := openai.DefaultConfig(apiKey)
 	config.BaseURL = baseURL
 
@@ -232,21 +279,40 @@ func streamChat(baseURL, apiKey, model string, messages []openai.ChatCompletionM
 
 	client := openai.NewClientWithConfig(config)
 
-	stream, err := client.CreateChatCompletionStream(
-		context.Background(),
-		openai.ChatCompletionRequest{
-			Model:     model,
-			Messages:  messages,
-			Stream:    true,
-			MaxTokens: maxTokens,
-		},
-	)
+	req := openai.ChatCompletionRequest{
+		Model:     model,
+		Messages:  messages,
+		Stream:    true,
+		MaxTokens: params.maxTokens,
+	}
+	if params.temperature != nil {
+		req.Temperature = *params.temperature
+	}
+	if params.topP != nil {
+		req.TopP = *params.topP
+	}
+	if params.presencePenalty != nil {
+		req.PresencePenalty = *params.presencePenalty
+	}
+	if params.frequencyPenalty != nil {
+		req.FrequencyPenalty = *params.frequencyPenalty
+	}
+
+	ctx := context.Background()
+	if params.timeoutSec > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(params.timeoutSec)*time.Second)
+		defer cancel()
+	}
+
+	stream, err := client.CreateChatCompletionStream(ctx, req)
 	if err != nil {
 		return fmt.Errorf("failed to create chat completion stream: %w", err)
 	}
 	defer stream.Close()
 
 	contentSeen := false
+	thinkingOpen := false
 	for {
 		response, err := stream.Recv()
 		if errors.Is(err, io.EOF) {
@@ -261,10 +327,24 @@ func streamChat(baseURL, apiKey, model string, messages []openai.ChatCompletionM
 		}
 		delta := response.Choices[0].Delta
 
+		if params.showThinking && delta.ReasoningContent != "" {
+			if !thinkingOpen {
+				fmt.Fprint(os.Stderr, "<think>")
+				thinkingOpen = true
+			}
+			fmt.Fprint(os.Stderr, delta.ReasoningContent)
+		}
 		if delta.Content != "" {
+			if thinkingOpen {
+				fmt.Fprintln(os.Stderr, "</think>")
+				thinkingOpen = false
+			}
 			fmt.Print(delta.Content)
 			contentSeen = true
 		}
+	}
+	if thinkingOpen {
+		fmt.Fprintln(os.Stderr, "</think>")
 	}
 	if contentSeen {
 		fmt.Println()
