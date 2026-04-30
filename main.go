@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 
 	openai "github.com/sashabaranov/go-openai"
@@ -98,6 +99,16 @@ func main() {
 		model = "glm-4.7"
 	}
 
+	maxTokens := 8192
+	if v := os.Getenv("maxTokens"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			fmt.Fprintf(os.Stderr, "Warning: invalid maxTokens=%q, using default %d\n", v, maxTokens)
+		} else {
+			maxTokens = n
+		}
+	}
+
 	customHeaders := parseEnvHeaders(os.Getenv("headers"))
 
 	// read prompt
@@ -156,7 +167,7 @@ func main() {
 		})
 	}
 
-	if err := streamChat(baseURL, apiKey, model, messages, customHeaders); err != nil {
+	if err := streamChat(baseURL, apiKey, model, messages, customHeaders, maxTokens); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
@@ -206,7 +217,7 @@ func readStdin() (string, error) {
 	return string(data), nil
 }
 
-func streamChat(baseURL, apiKey, model string, messages []openai.ChatCompletionMessage, customHeaders map[string]string) error {
+func streamChat(baseURL, apiKey, model string, messages []openai.ChatCompletionMessage, customHeaders map[string]string, maxTokens int) error {
 	config := openai.DefaultConfig(apiKey)
 	config.BaseURL = baseURL
 
@@ -224,9 +235,10 @@ func streamChat(baseURL, apiKey, model string, messages []openai.ChatCompletionM
 	stream, err := client.CreateChatCompletionStream(
 		context.Background(),
 		openai.ChatCompletionRequest{
-			Model:    model,
-			Messages: messages,
-			Stream:   true,
+			Model:     model,
+			Messages:  messages,
+			Stream:    true,
+			MaxTokens: maxTokens,
 		},
 	)
 	if err != nil {
@@ -234,6 +246,7 @@ func streamChat(baseURL, apiKey, model string, messages []openai.ChatCompletionM
 	}
 	defer stream.Close()
 
+	contentSeen := false
 	for {
 		response, err := stream.Recv()
 		if errors.Is(err, io.EOF) {
@@ -243,11 +256,19 @@ func streamChat(baseURL, apiKey, model string, messages []openai.ChatCompletionM
 			return fmt.Errorf("stream error: %w", err)
 		}
 
-		if len(response.Choices) > 0 {
-			fmt.Print(response.Choices[0].Delta.Content)
+		if len(response.Choices) == 0 {
+			continue
+		}
+		delta := response.Choices[0].Delta
+
+		if delta.Content != "" {
+			fmt.Print(delta.Content)
+			contentSeen = true
 		}
 	}
-	fmt.Println()
+	if contentSeen {
+		fmt.Println()
+	}
 
 	return nil
 }
