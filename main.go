@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -122,6 +123,7 @@ func main() {
 		}
 	}
 	params.showThinking = parseBoolEnv("showThinking")
+	params.verifyTLS = parseBoolEnvDefault("verifyTLS", false)
 
 	customHeaders := parseEnvHeaders(os.Getenv("headers"))
 
@@ -208,6 +210,7 @@ type chatParams struct {
 	frequencyPenalty *float32
 	timeoutSec       int
 	showThinking     bool
+	verifyTLS        bool
 }
 
 func parseFloatEnv(key string) *float32 {
@@ -231,6 +234,20 @@ func parseBoolEnv(key string) bool {
 		return true
 	}
 	return false
+}
+
+func parseBoolEnvDefault(key string, def bool) bool {
+	v := strings.TrimSpace(strings.ToLower(os.Getenv(key)))
+	switch v {
+	case "":
+		return def
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	}
+	fmt.Fprintf(os.Stderr, "Warning: invalid %s=%q, using default %v\n", key, v, def)
+	return def
 }
 
 func parseEnvHeaders(envVal string) map[string]string {
@@ -268,13 +285,20 @@ func streamChat(baseURL, apiKey, model string, messages []openai.ChatCompletionM
 	config := openai.DefaultConfig(apiKey)
 	config.BaseURL = baseURL
 
-	if len(customHeaders) > 0 {
-		config.HTTPClient = &http.Client{
-			Transport: &customTransport{
-				base:    http.DefaultTransport,
-				headers: customHeaders,
-			},
+	var transport http.RoundTripper = http.DefaultTransport
+	if !params.verifyTLS {
+		t := http.DefaultTransport.(*http.Transport).Clone()
+		if t.TLSClientConfig == nil {
+			t.TLSClientConfig = &tls.Config{}
 		}
+		t.TLSClientConfig.InsecureSkipVerify = true
+		transport = t
+	}
+	if len(customHeaders) > 0 {
+		transport = &customTransport{base: transport, headers: customHeaders}
+	}
+	if !params.verifyTLS || len(customHeaders) > 0 {
+		config.HTTPClient = &http.Client{Transport: transport}
 	}
 
 	client := openai.NewClientWithConfig(config)

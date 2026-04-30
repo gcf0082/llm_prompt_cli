@@ -7,6 +7,7 @@ import os
 import sys
 from pathlib import Path
 
+import httpx
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -26,6 +27,18 @@ def parse_headers(raw: str) -> dict:
 
 def parse_bool(raw: str) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def parse_bool_default(raw: str, default: bool) -> bool:
+    v = raw.strip().lower()
+    if v == "":
+        return default
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    print(f"Warning: invalid bool {v!r}, using default {default}", file=sys.stderr)
+    return default
 
 
 def parse_float_env(key: str):
@@ -139,6 +152,7 @@ def main() -> int:
             print(f"Warning: invalid timeout={raw_timeout!r}, ignored", file=sys.stderr)
 
     show_thinking = parse_bool(os.getenv("showThinking", ""))
+    verify_tls = parse_bool_default(os.getenv("verifyTLS", ""), False)
     custom_headers = parse_headers(os.getenv("headers", ""))
 
     # read prompt
@@ -188,6 +202,8 @@ def main() -> int:
         client_kwargs["default_headers"] = custom_headers
     if timeout is not None:
         client_kwargs["timeout"] = timeout
+    if not verify_tls:
+        client_kwargs["http_client"] = httpx.Client(verify=False, timeout=timeout)
     client = OpenAI(**client_kwargs)
 
     req_kwargs = {
