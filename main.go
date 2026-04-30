@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -21,7 +22,26 @@ func main() {
 	promptText := flag.String("prompt", "", "prompt text")
 	promptFile := flag.String("prompt-file", "", "read prompt from file")
 	configPath := flag.String("config", "", "config file path (default: .env)")
+	promptJSON := flag.Bool("prompt-json", false, "treat prompt content as raw JSON messages array for the chat completion API")
+	flag.Usage = func() {
+		fmt.Fprintf(flag.CommandLine.Output(), "Usage of %s:\n", os.Args[0])
+		flag.PrintDefaults()
+		fmt.Fprintln(flag.CommandLine.Output())
+		fmt.Fprintln(flag.CommandLine.Output(), "Examples:")
+		fmt.Fprintln(flag.CommandLine.Output(), "  llm_prompt_cli --prompt \"翻译为中文\" --input \"Hello world\"")
+		fmt.Fprintln(flag.CommandLine.Output(), "  llm_prompt_cli --prompt-file prompt.txt --input-file data.txt")
+		fmt.Fprintln(flag.CommandLine.Output(), "  cat file.txt | llm_prompt_cli --prompt \"总结以下内容\" --stdin")
+		fmt.Fprintln(flag.CommandLine.Output(), "  llm_prompt_cli --prompt \"explain this\" --config /path/to/.env")
+		fmt.Fprintln(flag.CommandLine.Output(), "  llm_prompt_cli --prompt-json --prompt '[{\"role\":\"system\",\"content\":\"翻译为中文\"},{\"role\":\"user\",\"content\":\"Hello\"}]'")
+		fmt.Fprintln(flag.CommandLine.Output(), "  llm_prompt_cli --prompt-json --prompt-file messages.json")
+	}
 	flag.Parse()
+
+	// no flags provided: show help like --help
+	if *promptText == "" && *promptFile == "" && *inputFile == "" && *inputText == "" && !*stdin && *configPath == "" {
+		flag.Usage()
+		os.Exit(0)
+	}
 
 	// validate prompt: exactly one required
 	promptCount := 0
@@ -33,8 +53,7 @@ func main() {
 	}
 	if promptCount != 1 {
 		fmt.Fprintln(os.Stderr, "Error: exactly one of --prompt, --prompt-file is required")
-		fmt.Fprintln(os.Stderr, "Usage: llm_prompt_cli --prompt <text> [--input <text> | --input-file <path> | --stdin] [--config <path>]")
-		fmt.Fprintln(os.Stderr, "       llm_prompt_cli --prompt-file <path> [--input <text> | --input-file <path> | --stdin] [--config <path>]")
+		flag.Usage()
 		os.Exit(1)
 	}
 
@@ -114,13 +133,30 @@ func main() {
 		}
 	}
 
-	// combine: if input exists, append after prompt
-	fullPrompt := prompt
+	// build messages
+	var messages []openai.ChatCompletionMessage
+	if *promptJSON {
+		if err := json.Unmarshal([]byte(prompt), &messages); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: --prompt-json requires valid JSON messages array: %v\n", err)
+			os.Exit(1)
+		}
+		if len(messages) == 0 {
+			fmt.Fprintln(os.Stderr, "Error: --prompt-json messages array is empty")
+			os.Exit(1)
+		}
+	} else {
+		messages = []openai.ChatCompletionMessage{
+			{Role: openai.ChatMessageRoleUser, Content: prompt},
+		}
+	}
 	if input != "" {
-		fullPrompt = prompt + "\n" + input
+		messages = append(messages, openai.ChatCompletionMessage{
+			Role:    openai.ChatMessageRoleUser,
+			Content: input,
+		})
 	}
 
-	if err := streamChat(baseURL, apiKey, model, fullPrompt, customHeaders); err != nil {
+	if err := streamChat(baseURL, apiKey, model, messages, customHeaders); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
@@ -170,7 +206,7 @@ func readStdin() (string, error) {
 	return string(data), nil
 }
 
-func streamChat(baseURL, apiKey, model, prompt string, customHeaders map[string]string) error {
+func streamChat(baseURL, apiKey, model string, messages []openai.ChatCompletionMessage, customHeaders map[string]string) error {
 	config := openai.DefaultConfig(apiKey)
 	config.BaseURL = baseURL
 
@@ -188,14 +224,9 @@ func streamChat(baseURL, apiKey, model, prompt string, customHeaders map[string]
 	stream, err := client.CreateChatCompletionStream(
 		context.Background(),
 		openai.ChatCompletionRequest{
-			Model: model,
-			Messages: []openai.ChatCompletionMessage{
-				{
-					Role:    openai.ChatMessageRoleUser,
-					Content: prompt,
-				},
-			},
-			Stream: true,
+			Model:    model,
+			Messages: messages,
+			Stream:   true,
 		},
 	)
 	if err != nil {
